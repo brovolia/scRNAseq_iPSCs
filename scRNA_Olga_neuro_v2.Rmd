@@ -1,0 +1,988 @@
+---
+title: Single-cell RNA-seq analysis of neural cells
+author: "LarisaOkorokova"
+date: "Generated on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	cache.lazy = FALSE
+)
+library(Seurat)
+library(Matrix)
+library(MAST)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(msigdbr)
+library(fgsea)
+library(monocle3)
+library(SeuratWrappers)
+library(CellChat)
+
+### Function to round the numbers to 3 decimal places in tables
+tidy.dataframe <- function(df) {
+    for (i in 1:ncol(df)) {
+        if (is.numeric(df[,i])) {
+            if (!is.integer(abs(df[,i]))) {
+              df[,i][(!is.na((df[,i]))&(abs(df[,i]) >= 0.001))] <- 
+                round(df[,i][(!is.na((df[,i]))&(abs(df[,i]) >= 0.001))], 3)
+              df[,i][!is.na((df[,i]))&(abs(df[,i]) < 0.001)] <- 
+                formatC(df[,i][!is.na((df[,i]))&(abs(df[,i]) < 0.001)], format = "e", digits = 1)
+            }
+        }
+    }
+    return(df)
+}
+
+make_objects <- function(DSG_matrix){
+  x <- CreateSeuratObject(DSG_matrix, min.cells = 3, min.features = 300)
+  x[["percent.mt"]] <- PercentageFeatureSet(x, pattern = "^MT-")
+  x[["percent.ribo"]] <- PercentageFeatureSet(x, pattern = "^RP[SL]")
+  return(x)
+}
+
+
+normalize_objects <- function(x){
+  x <- subset(x, subset = nCount_RNA < 15000 & percent.mt < 10)
+  x <- SCTransform(x, vars.to.regress = "percent.mt", method = "glmGamPoi", verbose = FALSE)
+  return(x)
+}
+```
+
+# Quality control of each sample
+
+Параметры для создания объектов:
+* min.cells = 3, min.features = 300 (ген экспрессируется минимум в 3 клетках, клетка содержит не менее 300 разных генов)
+* nCount_RNA < 15000 & percent.mt < 10 (отбираем клетки, которые содержат меньше 15000 UMI и меньше 10% митохондриальных РНК)
+* применяем SCT трансформацию для нормализации на размер библиотеки в каждой клетке.
+* интеграцию датасета делаем на основе SCT трансформации, количество IntegrationFeatures 3000
+
+
+```{r eval=FALSE, cache=TRUE, include=FALSE}
+seurat1 <- Read10X("./ScRNAseq_neuro/p5_1/filtered_feature_bc_matrix")
+seurat2 <- Read10X("./ScRNAseq_neuro/p5_2/filtered_feature_bc_matrix")
+seurat3 <- Read10X("./ScRNAseq_neuro/p25_1/filtered_feature_bc_matrix")
+seurat4 <- Read10X("./ScRNAseq_neuro/p25_2/filtered_feature_bc_matrix")
+```
+
+```{r eval=FALSE, include=FALSE}
+seurat_list <- list(seurat1,
+                    seurat2,
+                    seurat3,
+                    seurat4)
+
+list_SCT <- lapply(seurat_list, FUN = make_objects)
+
+list_SCT[[1]]$passage <- "p_5"
+list_SCT[[1]]$sample <- "p_5_1"
+
+list_SCT[[2]]$passage <- "p_5"
+list_SCT[[2]]$sample <- "p_5_2"
+
+list_SCT[[3]]$passage <- "p_25"
+list_SCT[[3]]$sample <- "p_25_1"
+
+list_SCT[[4]]$passage <- "p_25"
+list_SCT[[4]]$sample <- "p_25_2"
+```
+
+## QC plots before filtration
+
+```{r eval=FALSE, include=FALSE}
+for (i in list_SCT){
+  cat("Sample size (genes/cells)", dim(i), sep = "\n")
+  print(VlnPlot(i, features = c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo"), combine = TRUE, pt.size = 0, ncol = 5) &
+          theme(axis.title.x = element_blank(), axis.text.x = element_blank()))
+  print(FeatureScatter(i, "nCount_RNA", "nFeature_RNA") + 
+          scale_x_log10() + 
+          scale_y_log10()) + NoLegend()
+}
+```
+
+## QC plots after filtration
+
+```{r eval=FALSE, include=FALSE}
+list_SCT <- lapply(list_SCT, FUN = normalize_objects)
+
+for (i in list_SCT){
+  cat("Sample size (genes/cells)", dim(i), sep = "\n")
+  print(VlnPlot(i, features = c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo"), combine = TRUE, pt.size = 0, ncol = 5) &
+          theme(axis.title.x = element_blank(), axis.text.x = element_blank()))
+  print(FeatureScatter(i, "nCount_RNA", "nFeature_RNA") + 
+          scale_x_log10() + 
+          scale_y_log10()) + NoLegend()
+}
+
+gc()
+```
+
+## Integration into one object
+```{r eval=FALSE, include=FALSE}
+options(future.globals.maxSize= 8912896000)
+features <- SelectIntegrationFeatures(object.list = list_SCT, nfeatures = 3000)
+list_SCT <- PrepSCTIntegration(object.list = list_SCT, anchor.features = features, verbose = FALSE)
+anchors <- FindIntegrationAnchors(object.list = list_SCT, normalization.method = "SCT", 
+    anchor.features = features, verbose = FALSE)
+seurat <- IntegrateData(anchorset = anchors, normalization.method = "SCT", 
+    verbose = FALSE)
+gc()
+```
+
+## PCA
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=TRUE, include=FALSE}
+seurat <- RunPCA(seurat, verbose = FALSE)
+ElbowPlot(seurat, ndims = 50)
+```
+
+## PCA loadings
+```{r eval=FALSE, include=FALSE}
+DimPlot(seurat, reduction = "pca", label = TRUE, split.by = "passage") + NoLegend()
+DimPlot(seurat, reduction = "pca", label = TRUE, split.by = "passage", dims=c(3,4)) + NoLegend()
+DimHeatmap(seurat, dims = c(1, 2, 3, 4), ncol=2)
+
+loadings <- Loadings(seurat, reduction = "pca")[, 1:4]
+```
+
+## tSNE
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE, include=FALSE}
+seurat <- RunTSNE(seurat, dims=1:20)
+DimPlot(seurat, reduction = "tsne", label = FALSE) + NoLegend()
+```
+
+## UMAP
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE, include=FALSE}
+seurat <- RunUMAP(seurat, dims=1:20)
+DimPlot(seurat, reduction = "umap", label = TRUE)
+DimPlot(seurat, reduction = "umap", label = TRUE, split.by = "passage") + NoLegend()
+```
+
+
+## Clusters
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE, include=FALSE}
+seurat <- FindNeighbors(seurat, dims = 1:15, verbose = FALSE)
+seurat <- FindClusters(seurat, resolution=1, verbose = FALSE)
+```
+
+```{r}
+#save(seurat, file = "Olga_seurat.obj")
+load("Olga_seurat.obj")
+```
+
+```{r}
+DimPlot(seurat, reduction = "umap", label = TRUE) + NoLegend()
+DimPlot(seurat, reduction = "umap", label = TRUE, split.by = "passage") + NoLegend()
+
+DimPlot(seurat, reduction = "tsne", label = TRUE) + NoLegend()
+DimPlot(seurat, reduction = "tsne", label = TRUE, split.by = "passage") + NoLegend()
+
+DimPlot(seurat, reduction = "pca", label = TRUE, shuffle = TRUE) + NoLegend()
+DimPlot(seurat, reduction = "pca", label = TRUE, shuffle = TRUE, dims = c(2,3)) + NoLegend()
+```
+
+
+## Cluster occupancy
+```{r}
+meta_data <- seurat@meta.data %>% as.data.table
+
+
+occupancy <- meta_data[, .N, by=c("seurat_clusters", "passage")]
+occupancy[is.na(occupancy)] <- 0
+
+ggplot(occupancy, aes(y=N, x=seurat_clusters)) + 
+  geom_bar(position="stack", stat="identity") +
+  facet_grid(~passage) +
+  theme_bw()
+
+occupancy_to_show <- occupancy %>% dcast(., seurat_clusters ~ passage, value.var = "N")
+occupancy_to_show$percent_p5 <- round(occupancy_to_show$p_5 / sum(occupancy_to_show$p_5) * 100, digits = 2)
+occupancy_to_show$percent_p25 <- round(occupancy_to_show$p_25 / sum(occupancy_to_show$p_25) * 100, digits = 2)
+
+DT::datatable(occupancy_to_show, 
+              options = list(pageLength = 10, autoWidth = TRUE, rownames = F))
+```
+
+
+## Best cluster markers
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE, include=FALSE}
+DefaultAssay(seurat) <- "SCT"
+
+allMarkers <- FindAllMarkers(object = seurat,
+                                  assay='SCT',
+                                  only.pos = FALSE,
+                                  min.pct = 0.10,
+                                  test.use = 'MAST')
+
+```
+
+```{r}
+#fwrite(allMarkers, "allMarkers.csv", row.names = TRUE)
+
+allMarkers <- fread("allMarkers.csv")
+allMarkers$cluster <- as.factor(allMarkers$cluster)
+```
+
+```{r}
+goodMarkers <- allMarkers %>% group_by(cluster) %>% top_n(n = 1, wt = avg_log2FC)
+
+dot_plot <- DotPlot(seurat, unique(goodMarkers$gene), assay = "SCT")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+## Table with cluster markers
+
+```{r}
+markers_to_show <- allMarkers[allMarkers$p_val_adj < 0.05, ]
+markers_to_show <- as.data.frame(markers_to_show)
+
+DT::datatable(tidy.dataframe(markers_to_show),
+              filter = 'top', 
+              options = list(pageLength = 10, autoWidth = TRUE, rownames = F))
+
+fwrite(markers_to_show, "markers_of_clusters.csv")
+```
+
+## Cell cycle analysis
+
+```{r eval=FALSE, include=FALSE}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+seurat <- CellCycleScoring(seurat, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+head(seurat[[]])
+```
+
+```{r}
+#RidgePlot(seurat, features = c("PCNA", "TOP2A", "MCM6", "MKI67"), ncol = 2)
+```
+
+```{r eval=FALSE, include=FALSE}
+DimPlot(seurat, reduction = "umap", label = TRUE, split.by = "passage")
+DimPlot(seurat, reduction = "umap", label = TRUE, split.by = "passage", group.by = "Phase")
+DimPlot(seurat, reduction = "tsne", label = TRUE, split.by = "passage")
+DimPlot(seurat, reduction = "umap", label = TRUE, split.by = "passage", group.by = "seurat_clusters") + NoLegend()
+DimPlot(seurat, reduction = "tsne", label = TRUE, split.by = "passage", group.by = "seurat_clusters") + NoLegend()
+```
+
+
+```{r}
+meta_data <- seurat@meta.data %>% as.data.table
+
+
+cell_cycle <- meta_data[, .N, by=c("seurat_clusters", "Phase", "passage")]
+cell_cycle[is.na(cell_cycle)] <- 0
+
+ggplot(cell_cycle, aes(fill=Phase, y=N, x=seurat_clusters)) + 
+  geom_bar(position="stack", stat="identity") +
+  facet_grid(~passage) +
+  theme_bw()
+
+ggplot(cell_cycle, aes(fill=Phase, y=N, x=seurat_clusters)) + 
+  geom_bar(position="fill", stat="identity") +
+  facet_grid(~passage) +
+  theme_bw()
+
+cell_cycle <- dcast.data.table(cell_cycle, seurat_clusters ~ Phase + passage)
+cell_cycle[is.na(cell_cycle)] <- 0
+cell_cycle[, G1_p_25_prc := G1_p_25/(G1_p_25+G2M_p_25+S_p_25) * 100]
+cell_cycle[, G2M_p_25_prc := G2M_p_25/(G1_p_25+G2M_p_25+S_p_25) * 100]
+cell_cycle[, S_p_25_prc := S_p_25/(G1_p_25+G2M_p_25+S_p_25) * 100]
+
+cell_cycle[, G1_p_5_prc := G1_p_5/(G1_p_5+G2M_p_5+S_p_5) * 100]
+cell_cycle[, G2M_p_5_prc := G2M_p_5/(G1_p_5+G2M_p_5+S_p_5) * 100]
+cell_cycle[, S_p_5_prc := S_p_5/(G1_p_5+G2M_p_5+S_p_5) * 100]
+```
+
+
+## Neural G0 genes expression
+
+Based on article Neural G0: a quiescent-like state found in neuroepithelial-derived cells and glioma [link] (https://www.embopress.org/doi/full/10.15252/msb.20209522): The Neural G0 cluster showed significant repression of 246 genes peaking in other phases of the cell cycle, including suppression of CCND1 expression, which is an indicator of cell cycle exit, and other cell cycle-regulated genes such as AURKB, CCNB1/2, CDC20, CDK1, and MKI67. Moreover, the 158 up-regulated genes defining this cluster were genes with key roles in neural development, including glial cell differentiation, neurogenesis, neuron differentiation, and oligodendrocyte differentiation. These genes included transcription factors with known roles in balancing stem cell identity and differentiation, including BEX1, HEY1, HOPX, OLIG2, SOX2, SOX4, and SOX9.
+В эту статью можно пойти еще сильнее и попытаться идентифицировать G0 маркеры в нашей системе.
+
+#### Suppressed markers
+На графиках модем наблюдать, что маркеры AURKB, CCNB1/2, CDC20, CDK1, and MKI67 экспрессируются в нижней трети UMAP - там представлены пролиферирующие клетки. CCND1 экспрессируется в всей правой части UMAP и кластерах 7 и 15 - в этих клетках происходит cell cycle arrest и они собираются уходить в G0.
+
+```{r}
+for (i in c("CCND1", "AURKB", "CCNB1", "CCNB2", "CDC20", "CDK1", "MKI67")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+DotPlot(seurat, features = c("CCND1", "AURKB", "CCNB1", "CCNB2", "CDC20", "CDK1", "MKI67"), group.by = "seurat_clusters")
+```
+
+#### Upregulated genes
+BEX1 и SOX9 экспрессируются в левом хвосте UMAP значительно больше.
+
+```{r}
+for (i in c("BEX1", "HEY1", "HOPX", "OLIG2", "SOX2", "SOX4", "SOX9")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Generating files for CellPhoneDB
+```{r eval=FALSE, include=FALSE}
+count_raw <- seurat@assays$RNA@counts
+count_norm <- apply(count_raw, 2, function(x) (x/sum(x))*10000)
+count_norm <- as.data.frame(count_norm)
+
+ensembl_id_to_hgcn <- fread("features.tsv.gz", header = FALSE)
+
+count_norm$hgcn <- rownames(count_norm)
+count_norm <- merge(ensembl_id_to_hgcn[, c(1,2)], count_norm, by.x = "V2", by.y="hgcn", all.y = TRUE)
+count_norm$V2 <- NULL
+setnames(count_norm, "V1", "Gene") 
+fwrite(count_norm, "cellphonedb_count.txt", sep="\t", quote=F)
+
+meta_data <- cbind(rownames(seurat@meta.data), seurat@meta.data[, "seurat_clusters"])
+meta_data <- as.data.frame(meta_data)
+colnames(meta_data) <- c("Cell", "cell_type")
+# Cluster is the user’s corresponding cluster column.
+write.table(meta_data, 'cellphonedb_meta.txt', sep='\t', quote=F, row.names=F)
+```
+
+
+## Гены левого хвоста
+
+Гены, которые хорошо характеризуют левый хвост UMAP (экспрессия повышена) 
+"CRABP1" "STMN2", "DCX", "GAP43", "TUBB3", "MEIS2", "SOX11", "BASP1", "RTN1", "NCAM1"
+
+```{r}
+for (i in c("CRABP1", "STMN2", "DCX", "GAP43", "TUBB3", "MEIS2", "SOX11", "BASP1", "RTN1", "NCAM1")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+dot_plot <- DotPlot(seurat, features = c("CRABP1", "STMN2", "DCX", "GAP43", "TUBB3", "MEIS2", "SOX11", "BASP1", "RTN1", "NCAM1"), group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+Гены, которые хорошо характеризуют левый хвост UMAP (экспрессия понижена) 
+"PTN", "VIM", "CENPF", "HMGN2", "TOP2A", "CLU"
+
+```{r}
+for (i in c("PTN", "VIM", "CENPF", "HMGN2", "TOP2A", "CLU")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+dot_plot <- DotPlot(seurat, features = c("PTN", "VIM", "CENPF", "HMGN2", "TOP2A", "CLU"), group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+## Glia markers
+GFAP, S100B, OLIG1
+```{r}
+DotPlot(seurat, features = c('GFAP', "OLIG1", "S100B"),
+        group.by = "seurat_clusters")
+DotPlot(seurat, features = c('GFAP', "OLIG1", "S100B"),
+        group.by = "passage")
+
+VlnPlot(seurat, features = c('GFAP', "OLIG1", "S100B"), 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+```
+
+## Нейральные стволовые клетки
+Sox2, Pax6, NEST, ASCL1, POU3F2, PTBP1, REST, MSI1, SOX1
+
+```{r}
+dot_plot <- DotPlot(seurat, 
+                    features = c("SOX2", "PAX6", "NES", "ASCL1", "POU3F2", "PTBP1", "REST", "MSI1", "SOX1"),
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = c("SOX2", "PAX6", "NES", "ASCL1", "POU3F2", "PTBP1", "REST", "MSI1", "SOX1"),
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+VlnPlot(seurat, features = c("SOX2", "PAX6", "NES", "ASCL1", "POU3F2", "PTBP1", "REST", "MSI1", "SOX1"), 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+
+for (i in c("SOX2", "PAX6", "NES", "ASCL1", "POU3F2", "PTBP1", "REST", "MSI1", "SOX1")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+```
+
+## Нейроны в целом
+
+```{r}
+dot_plot <- DotPlot(seurat, 
+                    features = c("MAP2", "MAPT", "NCAM1", "RBFOX3", "SYP", "SYN1", "NEUROG2", "TH", "TUBB3"),
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = c("MAP2", "MAPT", "NCAM1", "RBFOX3", "SYP", "SYN1", "NEUROG2", "TH", "TUBB3"),
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+VlnPlot(seurat, features = c("MAP2", "MAPT", "NCAM1", "RBFOX3", "SYP", "SYN1", "NEUROG2", "TH", "TUBB3"), 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+
+for (i in c("MAP2", "MAPT", "NCAM1", "RBFOX3", "SYP", "SYN1", "NEUROG2", "TH", "TUBB3")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+```
+
+## ИПСК
+
+```{r}
+dot_plot <- DotPlot(seurat, 
+                    features = c("POU5F1", "SOX2", "TDGF1", "LIN28", "NANOG", "REX1", "DNMT3A"),
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = c("POU5F1", "SOX2", "TDGF1", "LIN28", "NANOG", "REX1", "DNMT3A"),
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+VlnPlot(seurat, features = c("POU5F1", "SOX2", "TDGF1", "LIN28", "NANOG", "REX1", "DNMT3A"), 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+#
+
+patchwork::wrap_plots(FeaturePlot(seurat, features="POU5F1", split.by = "passage", combine=FALSE)) &
+theme_minimal() & scale_color_gradient(low = "gray", high = "blue", limits = c(0,5))
+
+for (i in c("SOX2", "NANOG", "DNMT3A")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+
+```
+
+## Cluster 0 and 1
+CLU, SPARCL1, GFAP, S100B, OLIG1
+
+Top10 markers for cluster 0 
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 0]
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+Top10 markers for cluster 1 
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 1]
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+
+
+```{r}
+goodMarkers <- allMarkers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+
+
+dot_plot <- DotPlot(seurat, 
+                    features = c("CLU", "SPARCL1", "GFAP", "S100B", "OLIG1"),
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = c("CLU", "SPARCL1", "GFAP", "S100B", "OLIG1"),
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+patchwork::wrap_plots(FeaturePlot(seurat, features="GFAP", split.by = "passage", combine=FALSE)) &
+theme_minimal() & scale_color_gradient(low = "gray", high = "blue", limits = c(0,5))
+
+
+for (i in c("CLU", "SPARCL1", "GFAP", "S100B", "OLIG1")){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 7
+Переходный кластер к левому хвосту UMAP. На PCA этот кластер находится в отрицательных координатах по первой компоненте (в отличии от всего остального левого хвоста). 
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 7]
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+
+## Cluster 2
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 2]
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 3
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 3]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 4
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 4]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 6
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 6]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 14
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 14]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 15
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 15]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Cluster 17
+
+```{r}
+markers <- goodMarkers$gene[goodMarkers$cluster == 17]
+
+markers
+
+dot_plot <- DotPlot(seurat, 
+                    features = markers,
+                    group.by = "seurat_clusters")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+dot_plot <-DotPlot(seurat, 
+                   features = markers,
+                   group.by = "passage")
+dot_plot + theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+for (i in markers){
+  print(FeaturePlot(seurat, features = i, split.by = "passage"))
+}
+```
+
+## Interesting genes
+
+Среди генов, которые дифференциально экспрессируются при сравнении 5 и 25 пассажа поискала функциональную основу и обнаружила некоторые, на мой взгляд, интересные.
+
+#### PTN
+
+GOBP_NEGATIVE_REGULATION_OF_NEUROBLAST_PROLIFERATION - leading edge
+
+Thereby regulates many processes like cell proliferation, cell survival, cell growth, cell differentiation and cell migration in several tissues namely neuron and bone (PubMed:1733956, PubMed:1768439, PubMed:11278720, PubMed:19141530, PubMed:27445335, PubMed:30667096, PubMed:19442624). Also plays a role in synaptic plasticity and learning-related behavior by inhibiting long-term synaptic potentiation (By similarity). Through PTPRZ1 binding controls oligodendrocyte precursor cell differentiation by enhancing the phosphorylation of AFAP1L2 in order to activate the PI3K-AKT pathway (PubMed:27445335, PubMed:30667096). In adult hippocampus promotes dendritic arborization, spine development, and functional integration and connectivity of newborn granule neurons through ALK by activating AKT signaling pathway (By similarity). Binds GPC2 and chondroitin sulfate proteoglycans (CSPGs) at the neuron surface, leading to abrogation of binding between PTPRS and CSPGs and neurite outgrowth promotion (By similarity). Inhibits proliferation and enhances differentiation of neural stem cells by inhibiting FGF2-induced fibroblast growth factor receptor signaling pathway (By similarity).
+
+```{r}
+VlnPlot(seurat, features = "PTN", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+```
+
+### PA2G4
+Среди обогащенных путей имеется один очень занятный GSE16450_IMMATURE_VS_MATURE_NEURON_CELL_LINE_DN. leading edge (гены, которые внесли наибольший вклад в enrichment score) включает два гена PA2G4 и SLC16A1. Посмотрим на них
+
+```{r}
+VlnPlot(seurat, features = "PA2G4", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+```
+
+## SLC16A1
+
+```{r}
+VlnPlot(seurat, features = "SLC16A1", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+FeaturePlot(seurat, features = "SLC16A1", split.by = "passage")
+```
+
+## POU2F2
+Судя по распределению - маркер нейронов, экспрессия усиливается к 25 пассажу.
+```{r}
+VlnPlot(seurat, features = "POU2F2", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+
+FeaturePlot(seurat, features = "POU2F2", split.by = "passage")
+```
+
+#### HES1
+Marker of radial glia
+```{r}
+FeaturePlot(seurat, features = "HES1", split.by = "passage")
+VlnPlot(seurat, features = "HES1", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+```
+
+Интересный маркер радиальной глии HES1, который экспрессируется примерно в половине кластеров на 5 пассаже, но на 25 остается только в 4 и 17 кластере
+
+## HES5
+Marker of radial glia
+
+```{r}
+FeaturePlot(seurat, features = "HES5", split.by = "passage")
+VlnPlot(seurat, features = "HES5", 
+                 split.by = "passage", group.by = "seurat_clusters",
+                 pt.size = 0, combine = FALSE, adjust = 1, flip = TRUE)
+```
+
+
+
+
+
+## ReactomeGSA
+
+```{r}
+library(ReactomeGSA)
+
+Idents(seurat) <- seurat$seurat_clusters
+gsva_result <- analyse_sc_clusters(seurat, verbose = TRUE)
+pathway_expression <- pathways(gsva_result)
+
+# simplify the column names by removing the default dataset identifier
+colnames(pathway_expression) <- gsub("\\.Seurat", "", colnames(pathway_expression))
+
+
+max_difference <- do.call(rbind, apply(pathway_expression, 1, function(row) {
+    values <- as.numeric(row[2:length(row)])
+    return(data.frame(name = row[1], min = min(values), max = max(values)))
+}))
+
+max_difference$diff <- max_difference$max - max_difference$min
+
+# sort based on the difference
+max_difference <- max_difference[order(max_difference$diff, decreasing = T), ]
+
+DT::datatable(max_difference)
+```
+
+
+## Escape
+
+```{r echo=FALSE}
+suppressPackageStartupMessages(library(escape))
+suppressPackageStartupMessages(library(dittoSeq))
+suppressPackageStartupMessages(library(SingleCellExperiment))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(SeuratObject))
+```
+
+```{r}
+Seurat_Object_Diet <- DietSeurat(seurat, graphs = "pca")
+sce <- as.SingleCellExperiment(Seurat_Object_Diet)
+
+GS.hallmark <- getGeneSets(library = "H")
+ES.seurat <- enrichIt(obj = sce, gene.sets = GS.hallmark, groups = 1000, cores = 12)
+colnames(ES.seurat)
+
+seurat <- Seurat::AddMetaData(seurat, ES.seurat)
+save(seurat, file = "Olga_seurat_with_GOhallmarks.obj")
+save(ES.seurat, file = "ES.seurat.csv")
+```
+
+```{r}
+suppressPackageStartupMessages(library(escape))
+suppressPackageStartupMessages(library(dittoSeq))
+suppressPackageStartupMessages(library(SingleCellExperiment))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(SeuratObject))
+
+load("Olga_seurat_with_GOhallmarks.obj")
+load("ES.seurat.csv")
+colors <- colorRampPalette(c("#0348A6", "#7AC5FF", "#C6FDEC", "#FFB433", "#FF4B20"))
+
+dittoHeatmap(seurat, genes = NULL, metas = names(ES.seurat), 
+             annot.by = "seurat_clusters", 
+             fontsize = 7, 
+             cluster_cols = TRUE,
+             heatmap.colors = colors(50))
+
+dittoHeatmap(seurat, genes = NULL, 
+             metas = c("HALLMARK_NOTCH_SIGNALING", "HALLMARK_HEDGEHOG_SIGNALING", "HALLMARK_WNT_BETA_CATENIN_SIGNALING"), 
+             annot.by = "seurat_clusters", 
+             fontsize = 7, 
+             cluster_cols = TRUE,
+             heatmap.colors = colors(50))
+```
+
+## Identifying differential expressed genes across conditions
+```{r eval=FALSE, include=FALSE}
+head(seurat)
+
+seurat$cluster_passage <- paste(seurat$seurat_clusters, seurat$passage, sep = "_")
+seurat$old_idents <- Idents(seurat)
+Idents(seurat) <- "cluster_passage"
+
+response <- data.frame("p_val" = NA, "avg_log2FC" = NA, "pct.1" = NA, "pct.2" = NA, "p_val_adj" = NA, "gene" = NA, "cluster" = NA)
+
+for (i in 0:21){
+  try({
+    ident1 <- paste0(i,"_p_5")
+    ident2 <- paste0(i,"_p_25")
+    response_tmp <- FindMarkers(seurat, ident.1 = ident1, ident.2=ident2, verbose = FALSE, test.use = "MAST")
+    response_tmp$gene <- rownames(response_tmp)
+    rownames(response_tmp) <- NULL
+    response_tmp$cluster <- i
+    response <- rbind.data.frame(response, response_tmp)
+  })
+}
+
+fwrite(response, "DEG_Olga_neuro.csv")
+```
+
+### Table with all genes
+```{r}
+response <- fread("DEG_Olga_neuro.csv")
+response_to_show <- response[response$p_val_adj < 0.05, ]
+response_to_show <- as.data.frame(response_to_show)
+
+DT::datatable(tidy.dataframe(response_to_show),
+              filter = 'top', 
+              options = list(pageLength = 10, autoWidth = TRUE, rownames = F))
+```
+
+Число генов рибосомальных белков среди дифференциально экспрессированных генов.
+
+```{r eval=FALSE, include=FALSE}
+response_to_show$gene <- rownames(response_to_show)
+setDT(response_to_show)
+
+
+length(response_to_show[grepl("^RPL", response_to_show)])
+length(response_to_show[grepl("^RPS", response_to_show)])
+length(response_to_show[grepl("^MRPL",response_to_show)])
+length(response_to_show[grepl("^MRPS", response_to_show)])
+length(response_to_show[grepl("^MT-", response_to_show)])
+```
+ 
+
+## Monocle
+
+```{r eval=FALSE, include=FALSE}
+DefaultAssay(seurat) <- "RNA"
+
+cds <- as.cell_data_set(seurat)
+cds <- cluster_cells(cds)
+p1 <- plot_cells(cds, show_trajectory_graph = FALSE)
+p2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE)
+patchwork::wrap_plots(p1, p2)
+
+cds <- learn_graph(cds)
+plot_cells(cds, label_groups_by_cluster = FALSE, label_leaves = FALSE, label_branch_points = FALSE)
+
+cds <- order_cells(cds)
+plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE, label_leaves = FALSE, 
+    label_branch_points = FALSE)
+
+seurat_and_cds <- cds@principal_graph_aux$UMAP$pseudotime
+seurat$pseudotime <- seurat_and_cds
+head(seurat)
+```
+
+```{r}
+colfunc <- colorRampPalette(c("royalblue", "springgreen", "yellow", "red"))
+
+FeaturePlot(seurat, features = "pseudotime", split.by = "passage", cols = colfunc(50))
+```
+
+## SingleR
+```{r eval=FALSE, include=FALSE}
+library(celldex)
+library(SingleR)
+hpca.se <- HumanPrimaryCellAtlasData()
+hpca.se
+
+scobj <- GetAssayData(seurat)
+
+pred.hesc <- SingleR(test = scobj, ref = hpca.se, assay.type.test=1, labels = hpca.se$label.main)
+table(pred.hesc$labels)
+
+seurat[["SingleR.labels"]] <- pred.hesc$labels
+
+DimPlot(seurat, reduction = "umap", label = FALSE, split.by = "passage", group.by = "SingleR.labels")
+```
+
+```{r}
+meta_data <- seurat@meta.data %>% as.data.table
+
+singleR_annotation <- meta_data[, .N, by=c("seurat_clusters", "SingleR.labels", "passage")]
+singleR_annotation <- dcast.data.table(singleR_annotation, seurat_clusters ~ SingleR.labels + passage)
+
+DT::datatable(singleR_annotation)
+```
+
+## Cell chat
+```{r eval=FALSE, include=FALSE}
+seurat$cell_chat_idents <- seurat$seurat_clusters
+seurat$cell_chat_idents[seurat$cell_chat_idents == 0] <- 44 # no idea why it is working
+
+cellchat <- createCellChat(seurat, group.by = "cell_chat_idents")
+
+cellchat <- addMeta(cellchat, meta = seurat@meta.data)
+cellchat <- setIdent(cellchat, ident.use = "cell_chat_idents") # set "labels" as default cell identity
+levels(cellchat@idents) # show factor levels of the cell labels
+groupSize <- as.numeric(table(cellchat@idents)) # number of cells in each cell group
+
+
+CellChatDB <- CellChatDB.human
+cellchat@DB <- CellChatDB
+
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+future::plan("multiprocess", workers = 4) # do parallel
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+cellchat <- computeCommunProb(cellchat)
+# Filter out the cell-cell communication if there are only few number of cells in certain cell groups
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+```
+
+
+
+
