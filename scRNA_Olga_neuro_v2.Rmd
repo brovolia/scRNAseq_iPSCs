@@ -1,6 +1,5 @@
 ---
 title: Single-cell RNA-seq analysis of neural cells
-author: "LarisaOkorokova"
 date: "Generated on `r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_document:
